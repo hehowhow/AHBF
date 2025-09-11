@@ -403,7 +403,7 @@ class ResNet(nn.Module):
                     nn.Linear(64 * block.expansion, num_classes))
         if type == 'conv':
             for i in range(num_branches - 1):
-                setattr(self, 'afm_' + str(i), AHBF_f(64 * block.expansion))
+                setattr(self, 'afm_' + str(i), AHBF(64 * block.expansion))
         elif type == 'se':
             for i in range(num_branches - 1):
                 setattr(self, 'afm_' + str(i), AHBF_se(64 * block.expansion))
@@ -491,14 +491,14 @@ class ResNet(nn.Module):
         for i in range(0, self.num_branches - 1):
             if i == 0:
                 ensembleff, logit = getattr(self, 'afm_' + str(i))(featurelist[i], featurelist[i + 1], logitlist[i],
-                                                                   logitlist[i + 1],i+2)
+                                                                   logitlist[i + 1])
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
             else:
                 ensembleff, logit = getattr(self, 'afm_' + str(i))(ensem_fea[i - 1], featurelist[i + 1],
                                                                    ensem_logits[i - 1], logitlist[
-                                                                       i + 1],i+2)
+                                                                       i + 1])
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)

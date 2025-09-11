@@ -45,7 +45,8 @@ parser.add_argument('--resume', default='', type=str, help = 'Input the path of 
 parser.add_argument('--num_workers', default=8, type=int, help = 'Input the number of works: default(8)')
 parser.add_argument('--gpu_id', default='7', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
 parser.add_argument('--wandb_notes', default='', type=str)
-
+parser.add_argument('--version', default='v0', type=str)
+parser.add_argument('--dropout', default=0.0, type=float)
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
 print(args)

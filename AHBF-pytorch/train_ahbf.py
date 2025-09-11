@@ -55,7 +55,7 @@ parser.add_argument('--rampup', default=240, type=float, help='rampup function: 
 parser.add_argument('--kd_weight', default=1.5, type=float)
 parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
-parser.add_argument('--att_type', default='conv', type=str, help='use cbam\se\nonlocal to employ different attention mechanism: default(conv)')
+parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
 
 
 parser.add_argument('--wandb_notes', default='', type=str)
@@ -68,7 +68,7 @@ print(args)
 if os.path.exists(f'./results1{args.gpu_id}.txt'):
     pass
 else:
-    assert False, 'nofile'
+    open(f'./results1{args.gpu_id}.txt', 'a').close()
 
 # Use CUDA
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
@@ -101,8 +101,8 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
     # Use tqdm for progress bar
     with tqdm(total=len(train_loader)) as t:
         for i, (train_batch, labels_batch) in enumerate(train_loader):
-            train_batch = train_batch.cuda(non_blocking=True)
-            labels_batch = labels_batch.cuda(non_blocking=True)
+            train_batch = train_batch.to(device)
+            labels_batch = labels_batch.to(device)
 
             logitlist, ensem_logits = model(train_batch)
             loss_true = 0
@@ -203,8 +203,8 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
 
     with torch.no_grad():
         for _, (test_batch, labels_batch) in enumerate(test_loader):
-            test_batch = test_batch.cuda(non_blocking=True)
-            labels_batch = labels_batch.cuda(non_blocking=True)
+            test_batch = test_batch.to(device)
+            labels_batch = labels_batch.to(device)
 
             # compute model output and loss
             loss_true = 0
@@ -423,7 +423,7 @@ if __name__ == '__main__':
 
 
     if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model, device_ids=[0,1,2,3]).to(device)
+        model = nn.DataParallel(model).to(device)
     else:
         model = model.to(device)
 
