@@ -16,6 +16,7 @@ import models.data_loader as data_loader
 import models
 import models.model_backbone as model_backbone
 import wandb
+os.environ["WANDB_MODE"] = "offline"
 # Set the random seed for reproducible experiments
 random.seed(10)
 torch.manual_seed(10)

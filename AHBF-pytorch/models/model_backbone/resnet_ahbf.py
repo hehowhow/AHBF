@@ -375,7 +375,12 @@ class ResNet(nn.Module):
         self._norm_layer = norm_layer
 
         self.num_branches = num_branches
-        
+        # 添加历史融合输出存储（按样本级别）
+        self.use_adaptive_weighting = True  # 控制是否使用自适应加权
+        self.epoch_count = 0  # 记录当前epoch
+        self.prev_ensem_logits = {}  # 存储每个样本的历史融合输出 {sample_id: ensem_logit}
+        self.current_epoch_ensem_logits = {}  # 存储当前epoch的融合输出
+
         # 添加历史融合输出存储
         self.register_buffer('prev_ensem_logit', None)
         self.use_adaptive_weighting = True  # 控制是否使用自适应加权
@@ -455,48 +460,93 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def compute_cosine_similarities(self, logitlist, prev_ensem_logit):
+    def compute_cosine_similarities(self, logitlist, prev_ensem_logit, sample_ids=None):
         """
-        计算当前各分支logit与历史融合输出的余弦相似度
+        计算当前各分支logit与历史融合输出的余弦相似度（样本级别）
         Args:
             logitlist: 当前各分支的logit列表
             prev_ensem_logit: 上一轮的最后一个融合logit
+            sample_ids: 样本ID列表，用于索引历史融合输出
         Returns:
             similarities: 归一化后的相异度列表
         """
-        if prev_ensem_logit is None:
-            # 如果是第一轮，返回均匀权重
-            return [1.0] * len(logitlist)
-        
-        similarities = []
-        for logit in logitlist:
-            # 计算余弦相似度
-            cos_sim = F.cosine_similarity(logit.view(logit.size(0), -1), 
-                                        prev_ensem_logit.view(prev_ensem_logit.size(0), -1), 
-                                        dim=1)
-            # 取平均值
-            avg_cos_sim = cos_sim.mean()
-            similarities.append(avg_cos_sim.item())
-        
-        # 转换为相异度 (1 - 相似度)
-        dissimilarities = [1.0 - sim for sim in similarities]
-        
-        # 归一化相异度，使其和为1
-        total_dissim = sum(dissimilarities)
-        if total_dissim > 0:
-            normalized_dissim = [d / total_dissim for d in dissimilarities]
-        else:
-            normalized_dissim = [1.0 / len(dissimilarities)] * len(dissimilarities)
-        
-        return normalized_dissim
+        if prev_ensem_logit is None or self.epoch_count == 0 or sample_ids is None:
+            # 如果是第一个epoch或没有样本ID，返回均匀权重
+            batch_size = logitlist[0].size(0)
+            return [torch.ones(batch_size, device=logitlist[0].device)] * len(logitlist)
 
-    def forward(self, x):
+        batch_size = logitlist[0].size(0)
+        device = logitlist[0].device
+
+        # 为每个样本计算相异度
+        dissimilarities = []
+        for logit in logitlist:
+            sample_dissimilarities = torch.zeros(batch_size, device=device)
+
+            for i, sample_id in enumerate(sample_ids):
+                if sample_id in self.prev_ensem_logits:
+                    # 计算当前样本与历史融合输出的余弦相似度
+                    current_logit = logit[i:i + 1]  # 保持维度
+                    prev_logit = self.prev_ensem_logits[sample_id]
+
+                    cos_sim = F.cosine_similarity(
+                        current_logit.view(1, -1),
+                        prev_logit.view(1, -1),
+                        dim=1
+                    )
+                    # 转换为相异度
+                    sample_dissimilarities[i] = 1.0 - cos_sim.item()
+                else:
+                    # 如果没有历史记录，使用均匀权重
+                    sample_dissimilarities[i] = 1.0
+
+            dissimilarities.append(sample_dissimilarities)
+
+        # 归一化相异度，使每个样本的权重和为1
+        normalized_dissimilarities = []
+        for i in range(batch_size):
+            sample_dissim = [dissim[i] for dissim in dissimilarities]
+            total_dissim = sum(sample_dissim)
+            if total_dissim > 0:
+                normalized_sample_dissim = [d / total_dissim for d in sample_dissim]
+            else:
+                normalized_sample_dissim = [1.0 / len(sample_dissim)] * len(sample_dissim)
+
+            if i == 0:
+                normalized_dissimilarities = [[d] for d in normalized_sample_dissim]
+            else:
+                for j, d in enumerate(normalized_sample_dissim):
+                    normalized_dissimilarities[j].append(d)
+
+        # 转换为tensor
+        result = [torch.tensor(dissim, device=device) for dissim in normalized_dissimilarities]
+        return result
+
+    def update_epoch_history(self):
+        """
+        在epoch结束时更新历史融合输出（样本级别）
+        将当前epoch的融合输出存储为历史参考
+        """
+        # 将当前epoch的融合输出更新为历史参考
+        self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
+        # 清空当前epoch的记录
+        self.current_epoch_ensem_logits = {}
+        # 更新epoch计数
+        self.epoch_count += 1
+
+    def forward(self, x, sample_ids=None):
         # print('*'*50)
         # score_list=[]
         featurelist = []
         featurelist1 = []
         logitlist = []
         # print(x.shape,'xxxx')
+
+        # 如果没有提供sample_ids，生成基于batch位置的ID
+        if sample_ids is None:
+            batch_size = x.size(0)
+            # 使用简单的hash来生成样本ID（实际应用中可能需要更复杂的ID生成策略）
+            sample_ids = [hash(str(x[i].data_ptr())) for i in range(batch_size)]
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)  # B x 16 x 32 x 32
@@ -528,37 +578,42 @@ class ResNet(nn.Module):
         ensem_logits = []
 
         # 计算相异度权重
+        # 计算相异度权重（样本级别）
         if self.use_adaptive_weighting:
-            dissimilarities = self.compute_cosine_similarities(logitlist, self.prev_ensem_logit)
-            # 将权重转换为tensor，并移动到正确的设备
-            dissimilarities = [torch.tensor(d, device=x.device, dtype=x.dtype) for d in dissimilarities]
+            dissimilarities = self.compute_cosine_similarities(logitlist, None, sample_ids)
+            # dissimilarities已经是tensor列表，每个元素对应一个分支的样本级权重
         else:
             # 如果不使用自适应加权，使用均匀权重
-            dissimilarities = [torch.tensor(1.0, device=x.device, dtype=x.dtype) for _ in range(self.num_branches)]
+            batch_size = x.size(0)
+            dissimilarities = [torch.ones(batch_size, device=x.device, dtype=x.dtype) for _ in range(self.num_branches)]
 
         for i in range(0, self.num_branches - 1):
             if i == 0:
-                # 对第一个融合，使用相异度加权logit
-                weighted_logit_0 = logitlist[i] * dissimilarities[i]
-                weighted_logit_1 = logitlist[i + 1] * dissimilarities[i + 1]
-                ensembleff, logit = getattr(self, 'afm_' + str(i))(featurelist[i], featurelist[i + 1], 
+                # 对第一个融合，使用相异度加权logit（样本级别）
+                # 需要将权重扩展为与logit相同的形状
+                weight_0 = dissimilarities[i].view(-1, 1)  # [batch_size, 1]
+                weight_1 = dissimilarities[i + 1].view(-1, 1)  # [batch_size, 1]
+                weighted_logit_0 = logitlist[i] * weight_0
+                weighted_logit_1 = logitlist[i + 1] * weight_1
+                ensembleff, logit = getattr(self, 'afm_' + str(i))(featurelist[i], featurelist[i + 1],
                                                                    weighted_logit_0, weighted_logit_1)
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
             else:
-                # 对后续融合，使用相异度加权logit
-                weighted_ensem_logit = ensem_logits[i - 1] #* dissimilarities[0]  # 使用第一个分支的相异度作为融合输出的权重
-                weighted_logit_i_plus_1 = logitlist[i + 1] * dissimilarities[i + 1]
+                # 对后续融合，使用相异度加权logit（样本级别）
+                weight_i_plus_1 = dissimilarities[i + 1].view(-1, 1)  # [batch_size, 1]
+                weighted_logit_i_plus_1 = logitlist[i + 1] * weight_i_plus_1
                 ensembleff, logit = getattr(self, 'afm_' + str(i))(ensem_fea[i - 1], featurelist[i + 1],
-                                                                   weighted_ensem_logit, weighted_logit_i_plus_1)
+                                                                   ensem_logits[i - 1], weighted_logit_i_plus_1)
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
 
-        # 更新历史融合输出（存储最后一个融合logit）
+            # 存储当前batch的融合输出（样本级别）
         if len(ensem_logits) > 0:
-            self.prev_ensem_logit = ensem_logits[-1].detach()
+            for j, sample_id in enumerate(sample_ids):
+                self.current_epoch_ensem_logits[sample_id] = ensem_logits[-1][j].detach()
 
         return logitlist, ensem_logits
 
