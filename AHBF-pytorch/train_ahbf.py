@@ -58,9 +58,12 @@ parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
 parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
 parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='use adaptive weighting based on cosine similarity: default(True)')
-
+parser.add_argument('--use_contrastive_learning', default=True, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
+parser.add_argument('--contrastive_weight', default=0.2, type=float, help='weight for contrastive learning loss: default(0.1)')
+parser.add_argument('--contrastive_temp', default=0.1, type=float, help='temperature parameter for contrastive learning: default(0.1)')
 parser.add_argument('--wandb_notes', default='', type=str)
 parser.add_argument('--notes', default='', type=str)
+parser.add_argument('--multi_gpu',default=False,help="use multiple gpu to realize parallel computing")
 ll=time.time()
 
 args = parser.parse_args()
@@ -72,7 +75,10 @@ else:
     open(f'./results1{args.gpu_id}.txt', 'a').close()
 
 # Use CUDA
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+if args.multi_gpu==True:
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+else:
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 pdist = nn.PairwiseDistance(p=2)
@@ -80,7 +86,7 @@ pdist = nn.PairwiseDistance(p=2)
 
 
 
-def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, rampup_weight):
+def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, rampup_weight,epoch):
 
     # set model to training mode
     model.train()
@@ -102,15 +108,22 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
     # Use tqdm for progress bar
     with tqdm(total=len(train_loader)) as t:
         for i, (train_batch, labels_batch) in enumerate(train_loader):
-            train_batch = train_batch.to(device)
-            labels_batch = labels_batch.to(device)
+            train_batch = train_batch.cuda()
+            labels_batch = labels_batch.cuda()
+            output = model(train_batch)
 
-            logitlist, ensem_logits = model(train_batch)
+
+            if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
+                logitlist, ensem_logits, contrastive_loss = model(train_batch, labels=labels_batch)
+            else:
+                logitlist, ensem_logits, contrastive_loss = model(train_batch), [], torch.tensor(0.0, device=device)
+
             loss_true = 0
             loss_group_ekd = 0
             loss_group_dkd = 0
 
             for output in logitlist:
+
                 loss_true +=   criterion(output, labels_batch)
             for output_en in ensem_logits:
                 loss_true +=   criterion(output_en, labels_batch)
@@ -128,7 +141,8 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
             #     loss_group_ekd +=  criterion_T(logitlist[i + 1], ensem_logits[i]) * args.kd_weight * rampup_weight * args.lambda1
             #     loss_group_ekd +=  criterion_T(ensem_logits[i - 1], ensem_logits[i]) * args.kd_weight * rampup_weight * args.lambda1
 
-            loss = loss_true +  loss_group_dkd+loss_group_ekd
+            contrastive_weighted_loss = contrastive_loss * args.contrastive_weight
+            loss = loss_true + loss_group_dkd + loss_group_ekd + contrastive_weighted_loss
 
             loss_true_avg.update(loss_true.item())
             loss_group_ekd_avg.update(loss_group_ekd.item())
@@ -211,7 +225,7 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
             loss_true = 0
             loss_group_dkd = 0
             loss_group_ekd = 0
-            logitlist, ensem_logits = model(test_batch)
+            logitlist, ensem_logits, contrastive_loss = model(test_batch)
 
             for output in logitlist:
                 loss_true +=   criterion(output, labels_batch)
@@ -229,7 +243,8 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
 
 
 
-            loss = loss_true +  loss_group_dkd+loss_group_ekd
+            contrastive_weighted_loss = contrastive_loss * args.contrastive_weight
+            loss = loss_true + loss_group_dkd + loss_group_ekd + contrastive_weighted_loss
 
             loss_true_avg.update(loss_true.item())
             loss_group_ekd_avg.update(loss_group_ekd.item())
@@ -318,11 +333,17 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         rampup_weight = get_current_rampup_weight(epoch, args.rampup)*0.5
 
         # compute number of batches in one epoch (one full pass over the training set)
-        train_metrics = train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, rampup_weight)
+        train_metrics = train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, rampup_weight,epoch)
 
         test_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_weight)
 
         test_acc = test_metrics['test_accTop1_target']
+        if hasattr(model, 'update_epoch_history'):
+            if torch.cuda.device_count() > 1:
+                model.module.update_epoch_history()
+            else:
+                model.update_epoch_history()
+
 
 
         result_train_metrics[epoch] = train_metrics
@@ -425,6 +446,11 @@ if __name__ == '__main__':
     # 设置自适应加权参数
     if hasattr(model, 'use_adaptive_weighting'):
         model.use_adaptive_weighting = args.use_adaptive_weighting
+
+    # 设置对比学习参数
+    if hasattr(model, 'use_contrastive_learning'):
+        model.use_contrastive_learning = args.use_contrastive_learning
+        model.contrastive_temp = args.contrastive_temp
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model).to(device)
