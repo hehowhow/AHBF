@@ -398,7 +398,8 @@ class ResNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(self.feature_dim, self.feature_dim)  # 最终特征维度
         )
-        self.alpha = 0.5
+        self.alpha = 0.5  # 特征融合权重
+
         self.inplanes = 16
         self.dilation = 1
         if replace_stride_with_dilation is None:
@@ -474,17 +475,17 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def compute_cosine_similarities(self, logitlist, prev_ensem_logit, sample_ids=None):
+    def compute_cosine_similarities(self, logitlist, sample_ids=None):
         """
         计算当前各分支logit与历史融合输出的余弦相似度（样本级别）
+        使用self.prev_ensem_logits字典来查找每个样本上一轮epoch的融合logit
         Args:
             logitlist: 当前各分支的logit列表
-            prev_ensem_logit: 上一轮的最后一个融合logit
             sample_ids: 样本ID列表，用于索引历史融合输出
         Returns:
-            similarities: 归一化后的相异度列表
+            dissimilarities: 归一化后的相异度列表，每个元素对应一个分支的样本级权重
         """
-        if prev_ensem_logit is None or self.epoch_count == 0 or sample_ids is None:
+        if self.epoch_count == 0 or sample_ids is None or len(self.prev_ensem_logits) == 0:
             # 如果是第一个epoch或没有样本ID，返回均匀权重
             batch_size = logitlist[0].size(0)
             return [torch.ones(batch_size, device=logitlist[0].device)] * len(logitlist)
@@ -539,13 +540,12 @@ class ResNet(nn.Module):
     def update_epoch_history(self):
         """
         在epoch结束时更新历史融合输出（样本级别）
-        注意：类中心已经通过在线更新策略实时更新，无需在epoch结束时重新计算
+        将当前epoch的融合输出存储为历史参考
         """
         # 将当前epoch的融合输出更新为历史参考
         self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
         # 清空当前epoch的记录
         self.current_epoch_ensem_logits = {}
-        
         # 更新epoch计数
         self.epoch_count += 1
 
@@ -617,7 +617,7 @@ class ResNet(nn.Module):
             
             if label_id in self.class_centers:
                 # 自适应动量：样本越多，动量越大，更新越保守
-                adaptive_momentum = min(0.9, self.center_momentum + 
+                adaptive_momentum = min(0.99, self.center_momentum + 
                                        self.center_counts[label_id] * 0.001)
                 self.class_centers[label_id] = (
                     adaptive_momentum * self.class_centers[label_id] + 
@@ -628,7 +628,6 @@ class ResNet(nn.Module):
                 # 初始化类中心
                 self.class_centers[label_id] = feature
                 self.center_counts[label_id] = 1
-
 
     def forward(self, x, sample_ids=None, labels=None):
         # print('*'*50)
@@ -650,7 +649,7 @@ class ResNet(nn.Module):
         x = self.layer1(x)  # B x 16 x 32 x 32
         x = self.layer2(x)  # B x 32 x 16 x 16
         
-        # 提取基础特征用于对比学习
+        # 提取对比学习特征并更新类中心（在线更新）
         contrastive_features = None
         if self.use_contrastive_learning and labels is not None:
             # 将layer2的输出投影到64维特征向量
@@ -664,8 +663,13 @@ class ResNet(nn.Module):
         featurelist.append(x_3)
         x_3 = self.avgpool(x_3)  # B x 64 x 1 x 1
         x_3 = x_3.view(x_3.size(0), -1)  # B x 64
-        combined_features = self.alpha * x_3 + (1 - self.alpha) * contrastive_features
         # featurelist1.append(x_3)
+        
+        # 特征融合：将对比学习特征与分支特征进行加权融合
+        if contrastive_features is not None:
+            combined_features = self.alpha * x_3 + (1 - self.alpha) * contrastive_features
+        else:
+            combined_features = x_3
 
         x_3_1 = getattr(self, 'classifier3_0')(combined_features)  # B x num_classes
         logitlist.append(x_3_1)
@@ -677,8 +681,14 @@ class ResNet(nn.Module):
 
             temp = self.avgpool(temp)  # B x 64 x 1 x 1
             temp = temp.view(temp.size(0), -1)
-            combined_temp_features = self.alpha * temp + (1 - self.alpha) * contrastive_features
             # featurelist1.append(temp)
+            
+            # 特征融合：将对比学习特征与分支特征进行加权融合
+            if contrastive_features is not None:
+                combined_temp_features = self.alpha * temp + (1 - self.alpha) * contrastive_features
+            else:
+                combined_temp_features = temp
+                
             temp_out = getattr(self, 'classifier3_' + str(i))(combined_temp_features)
             logitlist.append(temp_out)
 
@@ -686,8 +696,9 @@ class ResNet(nn.Module):
         ensem_logits = []
 
         # 计算相异度权重（样本级别）
+        # 使用self.prev_ensem_logits字典查找每个样本上一轮epoch的融合logit
         if self.use_adaptive_weighting:
-            dissimilarities = self.compute_cosine_similarities(logitlist, None, sample_ids)
+            dissimilarities = self.compute_cosine_similarities(logitlist, sample_ids)
             # dissimilarities已经是tensor列表，每个元素对应一个分支的样本级权重
         else:
             # 如果不使用自适应加权，使用均匀权重
