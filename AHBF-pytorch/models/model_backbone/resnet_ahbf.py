@@ -375,6 +375,10 @@ class ResNet(nn.Module):
         self._norm_layer = norm_layer
 
         self.num_branches = num_branches
+        
+        # 添加历史融合输出存储
+        self.register_buffer('prev_ensem_logit', None)
+        self.use_adaptive_weighting = True  # 控制是否使用自适应加权
 
         self.inplanes = 16
         self.dilation = 1
@@ -451,6 +455,41 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def compute_cosine_similarities(self, logitlist, prev_ensem_logit):
+        """
+        计算当前各分支logit与历史融合输出的余弦相似度
+        Args:
+            logitlist: 当前各分支的logit列表
+            prev_ensem_logit: 上一轮的最后一个融合logit
+        Returns:
+            similarities: 归一化后的相异度列表
+        """
+        if prev_ensem_logit is None:
+            # 如果是第一轮，返回均匀权重
+            return [1.0] * len(logitlist)
+        
+        similarities = []
+        for logit in logitlist:
+            # 计算余弦相似度
+            cos_sim = F.cosine_similarity(logit.view(logit.size(0), -1), 
+                                        prev_ensem_logit.view(prev_ensem_logit.size(0), -1), 
+                                        dim=1)
+            # 取平均值
+            avg_cos_sim = cos_sim.mean()
+            similarities.append(avg_cos_sim.item())
+        
+        # 转换为相异度 (1 - 相似度)
+        dissimilarities = [1.0 - sim for sim in similarities]
+        
+        # 归一化相异度，使其和为1
+        total_dissim = sum(dissimilarities)
+        if total_dissim > 0:
+            normalized_dissim = [d / total_dissim for d in dissimilarities]
+        else:
+            normalized_dissim = [1.0 / len(dissimilarities)] * len(dissimilarities)
+        
+        return normalized_dissim
+
     def forward(self, x):
         # print('*'*50)
         # score_list=[]
@@ -488,20 +527,38 @@ class ResNet(nn.Module):
         ensem_fea = []
         ensem_logits = []
 
+        # 计算相异度权重
+        if self.use_adaptive_weighting:
+            dissimilarities = self.compute_cosine_similarities(logitlist, self.prev_ensem_logit)
+            # 将权重转换为tensor，并移动到正确的设备
+            dissimilarities = [torch.tensor(d, device=x.device, dtype=x.dtype) for d in dissimilarities]
+        else:
+            # 如果不使用自适应加权，使用均匀权重
+            dissimilarities = [torch.tensor(1.0, device=x.device, dtype=x.dtype) for _ in range(self.num_branches)]
+
         for i in range(0, self.num_branches - 1):
             if i == 0:
-                ensembleff, logit = getattr(self, 'afm_' + str(i))(featurelist[i], featurelist[i + 1], logitlist[i],
-                                                                   logitlist[i + 1])
+                # 对第一个融合，使用相异度加权logit
+                weighted_logit_0 = logitlist[i] * dissimilarities[i]
+                weighted_logit_1 = logitlist[i + 1] * dissimilarities[i + 1]
+                ensembleff, logit = getattr(self, 'afm_' + str(i))(featurelist[i], featurelist[i + 1], 
+                                                                   weighted_logit_0, weighted_logit_1)
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
             else:
+                # 对后续融合，使用相异度加权logit
+                weighted_ensem_logit = ensem_logits[i - 1] #* dissimilarities[0]  # 使用第一个分支的相异度作为融合输出的权重
+                weighted_logit_i_plus_1 = logitlist[i + 1] * dissimilarities[i + 1]
                 ensembleff, logit = getattr(self, 'afm_' + str(i))(ensem_fea[i - 1], featurelist[i + 1],
-                                                                   ensem_logits[i - 1], logitlist[
-                                                                       i + 1])
+                                                                   weighted_ensem_logit, weighted_logit_i_plus_1)
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
+
+        # 更新历史融合输出（存储最后一个融合logit）
+        if len(ensem_logits) > 0:
+            self.prev_ensem_logit = ensem_logits[-1].detach()
 
         return logitlist, ensem_logits
 

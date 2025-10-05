@@ -56,7 +56,7 @@ parser.add_argument('--kd_weight', default=1.5, type=float)
 parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
 parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
-
+parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='use adaptive weighting based on cosine similarity: default(True)')
 
 parser.add_argument('--wandb_notes', default='', type=str)
 parser.add_argument('--notes', default='', type=str)
@@ -421,6 +421,9 @@ if __name__ == '__main__':
         model_cfg = getattr(model_fd, 'mobile_ahbf')
         model = getattr(model_cfg, args.model)(branch = args.num_branches,aux=args.aux,num_classes = num_classes)
 
+    # 设置自适应加权参数
+    if hasattr(model, 'use_adaptive_weighting'):
+        model.use_adaptive_weighting = args.use_adaptive_weighting
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model).to(device)
