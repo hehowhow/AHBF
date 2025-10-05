@@ -384,7 +384,7 @@ if __name__ == '__main__':
         print("Directory does not exist! Making directory {}".format(model_dir))
         os.makedirs(model_dir)
     wandb.init(config=vars(args), project="AHBF", notes=args.wandb_notes, \
-               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight))
+               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight),mode = "offline")
 
     # Set the logger
     utils.set_logger(os.path.join(model_dir, 'train.log'))
