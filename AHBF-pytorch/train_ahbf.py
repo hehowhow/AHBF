@@ -57,6 +57,10 @@ parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
 parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
 parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='use adaptive weighting based on cosine similarity: default(True)')
+parser.add_argument('--use_contrastive_learning', default=True, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
+parser.add_argument('--contrastive_weight', default=0.1, type=float, help='weight for contrastive learning loss: default(0.1)')
+parser.add_argument('--contrastive_temp', default=0.1, type=float, help='temperature parameter for contrastive learning: default(0.1)')
+parser.add_argument('--center_momentum', default=0.9, type=float, help='momentum for online center update: default(0.9)')
 
 parser.add_argument('--wandb_notes', default='', type=str)
 parser.add_argument('--notes', default='', type=str)
@@ -104,7 +108,12 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
             train_batch = train_batch.to(device)
             labels_batch = labels_batch.to(device)
 
-            logitlist, ensem_logits = model(train_batch)
+            # 模型前向传播，现在返回对比学习损失
+            if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
+                logitlist, ensem_logits, contrastive_loss = model(train_batch, labels=labels_batch)
+            else:
+                logitlist, ensem_logits, contrastive_loss = model(train_batch), [], torch.tensor(0.0, device=device)
+            
             loss_true = 0
             loss_group_ekd = 0
             loss_group_dkd = 0
@@ -127,7 +136,9 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
             #     loss_group_ekd +=  criterion_T(logitlist[i + 1], ensem_logits[i]) * args.kd_weight * rampup_weight * args.lambda1
             #     loss_group_ekd +=  criterion_T(ensem_logits[i - 1], ensem_logits[i]) * args.kd_weight * rampup_weight * args.lambda1
 
-            loss = loss_true +  loss_group_dkd+loss_group_ekd
+            # 添加对比学习损失
+            contrastive_weighted_loss = contrastive_loss * args.contrastive_weight
+            loss = loss_true + loss_group_dkd + loss_group_ekd + contrastive_weighted_loss
 
             loss_true_avg.update(loss_true.item())
             loss_group_ekd_avg.update(loss_group_ekd.item())
@@ -210,7 +221,11 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
             loss_true = 0
             loss_group_dkd = 0
             loss_group_ekd = 0
-            logitlist, ensem_logits = model(test_batch)
+            # 在evaluate时也传递labels以计算对比学习损失
+            if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
+                logitlist, ensem_logits, contrastive_loss = model(test_batch, labels=labels_batch)
+            else:
+                logitlist, ensem_logits, contrastive_loss = model(test_batch), [], torch.tensor(0.0, device=device)
 
             for output in logitlist:
                 loss_true +=   criterion(output, labels_batch)
@@ -323,6 +338,12 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
 
         test_acc = test_metrics['test_accTop1_target']
 
+        # 在epoch结束时更新历史融合输出
+        if hasattr(model, 'update_epoch_history'):
+            if torch.cuda.device_count() > 1:
+                model.module.update_epoch_history()
+            else:
+                model.update_epoch_history()
 
         result_train_metrics[epoch] = train_metrics
         result_test_metrics[epoch] = test_metrics
@@ -424,6 +445,12 @@ if __name__ == '__main__':
     # 设置自适应加权参数
     if hasattr(model, 'use_adaptive_weighting'):
         model.use_adaptive_weighting = args.use_adaptive_weighting
+    
+    # 设置对比学习参数
+    if hasattr(model, 'use_contrastive_learning'):
+        model.use_contrastive_learning = args.use_contrastive_learning
+        model.contrastive_temp = args.contrastive_temp
+        model.center_momentum = args.center_momentum
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model).to(device)

@@ -376,10 +376,29 @@ class ResNet(nn.Module):
 
         self.num_branches = num_branches
         
-        # 添加历史融合输出存储
-        self.register_buffer('prev_ensem_logit', None)
+        # 添加历史融合输出存储（按样本级别）
         self.use_adaptive_weighting = True  # 控制是否使用自适应加权
-
+        self.epoch_count = 0  # 记录当前epoch
+        self.prev_ensem_logits = {}  # 存储每个样本的历史融合输出 {sample_id: ensem_logit}
+        self.current_epoch_ensem_logits = {}  # 存储当前epoch的融合输出
+        
+        # 对比学习相关参数
+        self.use_contrastive_learning = True  # 控制是否使用对比学习
+        self.feature_dim = 64  # 特征维度
+        self.contrastive_temp = 0.1  # 对比学习温度参数
+        self.class_centers = {}  # 存储每个类的中心特征向量 {class_id: center_vector}
+        self.center_momentum = 0.6  # 类中心动量更新参数
+        self.center_counts = {}  # 记录每个类的样本数量 {class_id: count}
+        
+        # 添加特征投影层：将layer2输出投影到64维
+        self.feature_projection = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # 全局平均池化
+            nn.Flatten(),
+            nn.Linear(32 * block.expansion, self.feature_dim),  # 投影到64维
+            nn.ReLU(inplace=True),
+            nn.Linear(self.feature_dim, self.feature_dim)  # 最终特征维度
+        )
+        self.alpha = 0.5
         self.inplanes = 16
         self.dilation = 1
         if replace_stride_with_dilation is None:
@@ -455,62 +474,200 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def compute_cosine_similarities(self, logitlist, prev_ensem_logit):
+    def compute_cosine_similarities(self, logitlist, prev_ensem_logit, sample_ids=None):
         """
-        计算当前各分支logit与历史融合输出的余弦相似度
+        计算当前各分支logit与历史融合输出的余弦相似度（样本级别）
         Args:
             logitlist: 当前各分支的logit列表
             prev_ensem_logit: 上一轮的最后一个融合logit
+            sample_ids: 样本ID列表，用于索引历史融合输出
         Returns:
             similarities: 归一化后的相异度列表
         """
-        if prev_ensem_logit is None:
-            # 如果是第一轮，返回均匀权重
-            return [1.0] * len(logitlist)
+        if prev_ensem_logit is None or self.epoch_count == 0 or sample_ids is None:
+            # 如果是第一个epoch或没有样本ID，返回均匀权重
+            batch_size = logitlist[0].size(0)
+            return [torch.ones(batch_size, device=logitlist[0].device)] * len(logitlist)
         
-        similarities = []
+        batch_size = logitlist[0].size(0)
+        device = logitlist[0].device
+        
+        # 为每个样本计算相异度
+        dissimilarities = []
         for logit in logitlist:
-            # 计算余弦相似度
-            cos_sim = F.cosine_similarity(logit.view(logit.size(0), -1), 
-                                        prev_ensem_logit.view(prev_ensem_logit.size(0), -1), 
-                                        dim=1)
-            # 取平均值
-            avg_cos_sim = cos_sim.mean()
-            similarities.append(avg_cos_sim.item())
+            sample_dissimilarities = torch.zeros(batch_size, device=device)
+            
+            for i, sample_id in enumerate(sample_ids):
+                if sample_id in self.prev_ensem_logits:
+                    # 计算当前样本与历史融合输出的余弦相似度
+                    current_logit = logit[i:i+1]  # 保持维度
+                    prev_logit = self.prev_ensem_logits[sample_id]
+                    
+                    cos_sim = F.cosine_similarity(
+                        current_logit.view(1, -1), 
+                        prev_logit.view(1, -1), 
+                        dim=1
+                    )
+                    # 转换为相异度
+                    sample_dissimilarities[i] = 1.0 - cos_sim.item()
+                else:
+                    # 如果没有历史记录，使用均匀权重
+                    sample_dissimilarities[i] = 1.0
+            
+            dissimilarities.append(sample_dissimilarities)
         
-        # 转换为相异度 (1 - 相似度)
-        dissimilarities = [1.0 - sim for sim in similarities]
+        # 归一化相异度，使每个样本的权重和为1
+        normalized_dissimilarities = []
+        for i in range(batch_size):
+            sample_dissim = [dissim[i] for dissim in dissimilarities]
+            total_dissim = sum(sample_dissim)
+            if total_dissim > 0:
+                normalized_sample_dissim = [d / total_dissim for d in sample_dissim]
+            else:
+                normalized_sample_dissim = [1.0 / len(sample_dissim)] * len(sample_dissim)
+            
+            if i == 0:
+                normalized_dissimilarities = [[d] for d in normalized_sample_dissim]
+            else:
+                for j, d in enumerate(normalized_sample_dissim):
+                    normalized_dissimilarities[j].append(d)
         
-        # 归一化相异度，使其和为1
-        total_dissim = sum(dissimilarities)
-        if total_dissim > 0:
-            normalized_dissim = [d / total_dissim for d in dissimilarities]
-        else:
-            normalized_dissim = [1.0 / len(dissimilarities)] * len(dissimilarities)
-        
-        return normalized_dissim
+        # 转换为tensor
+        result = [torch.tensor(dissim, device=device) for dissim in normalized_dissimilarities]
+        return result
 
-    def forward(self, x):
+    def update_epoch_history(self):
+        """
+        在epoch结束时更新历史融合输出（样本级别）
+        注意：类中心已经通过在线更新策略实时更新，无需在epoch结束时重新计算
+        """
+        # 将当前epoch的融合输出更新为历史参考
+        self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
+        # 清空当前epoch的记录
+        self.current_epoch_ensem_logits = {}
+        
+        # 更新epoch计数
+        self.epoch_count += 1
+
+    def compute_contrastive_loss(self, features, labels):
+        """
+        计算InfoNCE对比学习损失
+        Args:
+            features: 特征向量 [batch_size, feature_dim]
+            labels: 标签 [batch_size]
+        Returns:
+            contrastive_loss: 对比学习损失
+        """
+        if not self.use_contrastive_learning:
+            return torch.tensor(0.0, device=features.device)
+        
+        # 如果类中心太少，使用简化的对比学习
+        if len(self.class_centers) < 2:
+            return torch.tensor(0.0, device=features.device)
+        
+        batch_size = features.size(0)
+        device = features.device
+        
+        # 计算与所有类中心的相似度
+        similarities = []
+        for class_id in self.class_centers:
+            center = self.class_centers[class_id].to(device)
+            # 计算余弦相似度
+            sim = F.cosine_similarity(features, center.unsqueeze(0).expand(batch_size, -1), dim=1)
+            similarities.append(sim)
+        
+        # 堆叠相似度 [batch_size, num_classes]
+        similarities = torch.stack(similarities, dim=1) / self.contrastive_temp
+        
+        # 计算InfoNCE损失
+        contrastive_loss = 0.0
+        for i in range(batch_size):
+            label = labels[i].item()
+            if label in self.class_centers:
+                # 正样本相似度（同类）
+                pos_sim = similarities[i, label]
+                # 负样本相似度（异类）
+                neg_sims = similarities[i]
+                # 移除正样本
+                mask = torch.ones_like(neg_sims, dtype=torch.bool)
+                mask[label] = False
+                neg_sims = neg_sims[mask]
+                
+                if len(neg_sims) > 0:
+                    # InfoNCE损失：-log(exp(pos_sim) / (exp(pos_sim) + sum(exp(neg_sims))))
+                    logits = torch.cat([pos_sim.unsqueeze(0), neg_sims])
+                    log_prob = pos_sim - torch.logsumexp(logits, dim=0)
+                    contrastive_loss += -log_prob
+        
+        return contrastive_loss / batch_size
+
+    def update_class_centers_online(self, features, labels):
+        """
+        在线更新类中心特征向量（自适应动量更新）
+        Args:
+            features: 当前batch的特征向量 [batch_size, feature_dim]
+            labels: 当前batch的标签 [batch_size]
+        """
+        if not self.use_contrastive_learning:
+            return
+        
+        for i, label in enumerate(labels):
+            label_id = label.item()
+            feature = features[i].detach()
+            
+            if label_id in self.class_centers:
+                # 自适应动量：样本越多，动量越大，更新越保守
+                adaptive_momentum = min(0.9, self.center_momentum + 
+                                       self.center_counts[label_id] * 0.001)
+                self.class_centers[label_id] = (
+                    adaptive_momentum * self.class_centers[label_id] + 
+                    (1 - adaptive_momentum) * feature
+                )
+                self.center_counts[label_id] += 1
+            else:
+                # 初始化类中心
+                self.class_centers[label_id] = feature
+                self.center_counts[label_id] = 1
+
+
+    def forward(self, x, sample_ids=None, labels=None):
         # print('*'*50)
         # score_list=[]
         featurelist = []
         featurelist1 = []
         logitlist = []
         # print(x.shape,'xxxx')
+        
+        # 如果没有提供sample_ids，生成基于batch位置的ID
+        if sample_ids is None:
+            batch_size = x.size(0)
+            # 使用简单的hash来生成样本ID（实际应用中可能需要更复杂的ID生成策略）
+            sample_ids = [hash(str(x[i].data_ptr())) for i in range(batch_size)]
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)  # B x 16 x 32 x 32
 
         x = self.layer1(x)  # B x 16 x 32 x 32
         x = self.layer2(x)  # B x 32 x 16 x 16
+        
+        # 提取基础特征用于对比学习
+        contrastive_features = None
+        if self.use_contrastive_learning and labels is not None:
+            # 将layer2的输出投影到64维特征向量
+            contrastive_features = self.feature_projection(x)  # [batch_size, 64]
+            
+            # 在线更新类中心（动量更新）
+            self.update_class_centers_online(contrastive_features, labels)
+        
         x_3 = getattr(self, 'layer3_0')(x)  # B x 64 x 8 x 8
         # print(x_3.shape,'x_3')
         featurelist.append(x_3)
         x_3 = self.avgpool(x_3)  # B x 64 x 1 x 1
         x_3 = x_3.view(x_3.size(0), -1)  # B x 64
+        combined_features = self.alpha * x_3 + (1 - self.alpha) * contrastive_features
         # featurelist1.append(x_3)
 
-        x_3_1 = getattr(self, 'classifier3_0')(x_3)  # B x num_classes
+        x_3_1 = getattr(self, 'classifier3_0')(combined_features)  # B x num_classes
         logitlist.append(x_3_1)
 
         for i in range(1, self.num_branches):
@@ -520,47 +677,57 @@ class ResNet(nn.Module):
 
             temp = self.avgpool(temp)  # B x 64 x 1 x 1
             temp = temp.view(temp.size(0), -1)
+            combined_temp_features = self.alpha * temp + (1 - self.alpha) * contrastive_features
             # featurelist1.append(temp)
-            temp_out = getattr(self, 'classifier3_' + str(i))(temp)
+            temp_out = getattr(self, 'classifier3_' + str(i))(combined_temp_features)
             logitlist.append(temp_out)
 
         ensem_fea = []
         ensem_logits = []
 
-        # 计算相异度权重
+        # 计算相异度权重（样本级别）
         if self.use_adaptive_weighting:
-            dissimilarities = self.compute_cosine_similarities(logitlist, self.prev_ensem_logit)
-            # 将权重转换为tensor，并移动到正确的设备
-            dissimilarities = [torch.tensor(d, device=x.device, dtype=x.dtype) for d in dissimilarities]
+            dissimilarities = self.compute_cosine_similarities(logitlist, None, sample_ids)
+            # dissimilarities已经是tensor列表，每个元素对应一个分支的样本级权重
         else:
             # 如果不使用自适应加权，使用均匀权重
-            dissimilarities = [torch.tensor(1.0, device=x.device, dtype=x.dtype) for _ in range(self.num_branches)]
+            batch_size = x.size(0)
+            dissimilarities = [torch.ones(batch_size, device=x.device, dtype=x.dtype) for _ in range(self.num_branches)]
 
         for i in range(0, self.num_branches - 1):
             if i == 0:
-                # 对第一个融合，使用相异度加权logit
-                weighted_logit_0 = logitlist[i] * dissimilarities[i]
-                weighted_logit_1 = logitlist[i + 1] * dissimilarities[i + 1]
+                # 对第一个融合，使用相异度加权logit（样本级别）
+                # 需要将权重扩展为与logit相同的形状
+                weight_0 = dissimilarities[i].view(-1, 1)  # [batch_size, 1]
+                weight_1 = dissimilarities[i + 1].view(-1, 1)  # [batch_size, 1]
+                weighted_logit_0 = logitlist[i] * weight_0
+                weighted_logit_1 = logitlist[i + 1] * weight_1
                 ensembleff, logit = getattr(self, 'afm_' + str(i))(featurelist[i], featurelist[i + 1], 
                                                                    weighted_logit_0, weighted_logit_1)
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
             else:
-                # 对后续融合，使用相异度加权logit
-                weighted_ensem_logit = ensem_logits[i - 1] #* dissimilarities[0]  # 使用第一个分支的相异度作为融合输出的权重
-                weighted_logit_i_plus_1 = logitlist[i + 1] * dissimilarities[i + 1]
+                # 对后续融合，使用相异度加权logit（样本级别）
+                weight_i_plus_1 = dissimilarities[i + 1].view(-1, 1)  # [batch_size, 1]
+                weighted_logit_i_plus_1 = logitlist[i + 1] * weight_i_plus_1
                 ensembleff, logit = getattr(self, 'afm_' + str(i))(ensem_fea[i - 1], featurelist[i + 1],
-                                                                   weighted_ensem_logit, weighted_logit_i_plus_1)
+                                                                   ensem_logits[i - 1], weighted_logit_i_plus_1)
                 # score_list.append(sco_list)
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
 
-        # 更新历史融合输出（存储最后一个融合logit）
+        # 存储当前batch的融合输出（样本级别）
         if len(ensem_logits) > 0:
-            self.prev_ensem_logit = ensem_logits[-1].detach()
+            for j, sample_id in enumerate(sample_ids):
+                self.current_epoch_ensem_logits[sample_id] = ensem_logits[-1][j].detach()
 
-        return logitlist, ensem_logits
+        # 计算对比学习损失
+        contrastive_loss = torch.tensor(0.0, device=x.device)
+        if self.use_contrastive_learning and labels is not None and contrastive_features is not None:
+            contrastive_loss = self.compute_contrastive_loss(contrastive_features, labels)
+
+        return logitlist, ensem_logits, contrastive_loss
 
         # return logitlist, ensem_logits, featurelist
 
