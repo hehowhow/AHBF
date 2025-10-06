@@ -380,10 +380,24 @@ class ResNet(nn.Module):
         self.epoch_count = 0  # 记录当前epoch
         self.prev_ensem_logits = {}  # 存储每个样本的历史融合输出 {sample_id: ensem_logit}
         self.current_epoch_ensem_logits = {}  # 存储当前epoch的融合输出
-
-        # 添加历史融合输出存储
-        self.register_buffer('prev_ensem_logit', None)
-        self.use_adaptive_weighting = True  # 控制是否使用自适应加权
+        
+        # 对比学习相关参数（纯在线更新）
+        self.use_contrastive_learning = True  # 控制是否使用对比学习
+        self.feature_dim = 64  # 特征维度
+        self.contrastive_temp = 0.1  # 对比学习温度参数
+        self.class_centers = {}  # 存储每个类的中心特征向量 {class_id: center_vector}
+        self.center_momentum = 0.6  # 类中心动量更新参数
+        self.center_counts = {}  # 记录每个类的样本数量 {class_id: count}
+        
+        # 添加特征投影层：将layer2输出投影到64维
+        self.feature_projection = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # 全局平均池化
+            nn.Flatten(),
+            nn.Linear(32 * block.expansion, self.feature_dim),  # 投影到64维
+            nn.ReLU(inplace=True),
+            nn.Linear(self.feature_dim, self.feature_dim)  # 最终特征维度
+        )
+        self.alpha = 0.5  # 特征融合权重
 
         self.inplanes = 16
         self.dilation = 1
@@ -526,6 +540,7 @@ class ResNet(nn.Module):
         """
         在epoch结束时更新历史融合输出（样本级别）
         将当前epoch的融合输出存储为历史参考
+        注意：类中心通过在线更新策略实时更新，无需在epoch结束时重新计算
         """
         # 将当前epoch的融合输出更新为历史参考
         self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
@@ -534,7 +549,100 @@ class ResNet(nn.Module):
         # 更新epoch计数
         self.epoch_count += 1
 
-    def forward(self, x, sample_ids=None):
+    def compute_contrastive_loss(self, features, labels):
+        """
+        计算InfoNCE对比学习损失
+        Args:
+            features: 特征向量 [batch_size, feature_dim]
+            labels: 标签 [batch_size]
+        Returns:
+            contrastive_loss: 对比学习损失
+        """
+        if not self.use_contrastive_learning:
+            return torch.tensor(0.0, device=features.device)
+        
+        # 如果类中心太少，使用简化的对比学习
+        if len(self.class_centers) < 2:
+            return torch.tensor(0.0, device=features.device)
+        
+        batch_size = features.size(0)
+        device = features.device
+        
+        # 建立类别ID到索引的映射
+        class_ids = sorted(self.class_centers.keys())
+        class_id_to_idx = {class_id: idx for idx, class_id in enumerate(class_ids)}
+        
+        # 计算与所有类中心的相似度
+        similarities = []
+        for class_id in class_ids:
+            center = self.class_centers[class_id].to(device)
+            # 计算余弦相似度
+            sim = F.cosine_similarity(features, center.unsqueeze(0).expand(batch_size, -1), dim=1)
+            similarities.append(sim)
+        
+        # 堆叠相似度 [batch_size, num_existing_classes]
+        similarities = torch.stack(similarities, dim=1) / self.contrastive_temp
+        
+        # 计算InfoNCE损失
+        contrastive_loss = 0.0
+        valid_samples = 0
+        for i in range(batch_size):
+            label = labels[i].item()
+            if label in self.class_centers:
+                # 获取该类别在类中心列表中的索引
+                label_idx = class_id_to_idx[label]
+                
+                # 正样本相似度（同类）
+                pos_sim = similarities[i, label_idx]
+                
+                # 负样本相似度（异类）- 除了当前类别的所有类中心
+                neg_sims = torch.cat([
+                    similarities[i, :label_idx],
+                    similarities[i, label_idx+1:]
+                ])
+                
+                if len(neg_sims) > 0:
+                    # InfoNCE损失：-log(exp(pos_sim) / (exp(pos_sim) + sum(exp(neg_sims))))
+                    logits = torch.cat([pos_sim.unsqueeze(0), neg_sims])
+                    log_prob = pos_sim - torch.logsumexp(logits, dim=0)
+                    contrastive_loss += -log_prob
+                    valid_samples += 1
+        
+        # 只对有效样本计算平均损失
+        if valid_samples > 0:
+            return contrastive_loss / valid_samples
+        else:
+            return torch.tensor(0.0, device=features.device)
+
+    def update_class_centers_online(self, features, labels):
+        """
+        在线更新类中心特征向量（自适应动量更新）
+        Args:
+            features: 当前batch的特征向量 [batch_size, feature_dim]
+            labels: 当前batch的标签 [batch_size]
+        """
+        if not self.use_contrastive_learning:
+            return
+        
+        for i, label in enumerate(labels):
+            label_id = label.item()
+            feature = features[i].detach()
+            
+            if label_id in self.class_centers:
+                # 自适应动量：样本越多，动量越大，更新越保守
+                adaptive_momentum = min(0.99, self.center_momentum + 
+                                       self.center_counts[label_id] * 0.001)
+                self.class_centers[label_id] = (
+                    adaptive_momentum * self.class_centers[label_id] + 
+                    (1 - adaptive_momentum) * feature
+                )
+                self.center_counts[label_id] += 1
+            else:
+                # 初始化类中心
+                self.class_centers[label_id] = feature
+                self.center_counts[label_id] = 1
+
+    def forward(self, x, sample_ids=None, labels=None):
         # print('*'*50)
         # score_list=[]
         featurelist = []
@@ -553,14 +661,30 @@ class ResNet(nn.Module):
 
         x = self.layer1(x)  # B x 16 x 32 x 32
         x = self.layer2(x)  # B x 32 x 16 x 16
+        
+        # 提取对比学习特征并更新类中心（在线更新）
+        contrastive_features = None
+        if self.use_contrastive_learning and labels is not None:
+            # 将layer2的输出投影到64维特征向量
+            contrastive_features = self.feature_projection(x)  # [batch_size, 64]
+            
+            # 在线更新类中心（动量更新）
+            self.update_class_centers_online(contrastive_features, labels)
+        
         x_3 = getattr(self, 'layer3_0')(x)  # B x 64 x 8 x 8
         # print(x_3.shape,'x_3')
         featurelist.append(x_3)
         x_3 = self.avgpool(x_3)  # B x 64 x 1 x 1
         x_3 = x_3.view(x_3.size(0), -1)  # B x 64
         # featurelist1.append(x_3)
+        
+        # 特征融合：将对比学习特征与分支特征进行加权融合
+        if contrastive_features is not None:
+            combined_features = self.alpha * x_3 + (1 - self.alpha) * contrastive_features
+        else:
+            combined_features = x_3
 
-        x_3_1 = getattr(self, 'classifier3_0')(x_3)  # B x num_classes
+        x_3_1 = getattr(self, 'classifier3_0')(combined_features)  # B x num_classes
         logitlist.append(x_3_1)
 
         for i in range(1, self.num_branches):
@@ -571,7 +695,14 @@ class ResNet(nn.Module):
             temp = self.avgpool(temp)  # B x 64 x 1 x 1
             temp = temp.view(temp.size(0), -1)
             # featurelist1.append(temp)
-            temp_out = getattr(self, 'classifier3_' + str(i))(temp)
+            
+            # 特征融合：将对比学习特征与分支特征进行加权融合
+            if contrastive_features is not None:
+                combined_temp_features = self.alpha * temp + (1 - self.alpha) * contrastive_features
+            else:
+                combined_temp_features = temp
+                
+            temp_out = getattr(self, 'classifier3_' + str(i))(combined_temp_features)
             logitlist.append(temp_out)
 
         ensem_fea = []
@@ -610,12 +741,17 @@ class ResNet(nn.Module):
                 ensem_logits.append(logit)
                 ensem_fea.append(ensembleff)
 
-            # 存储当前batch的融合输出（样本级别）
+        # 存储当前batch的融合输出（样本级别）
         if len(ensem_logits) > 0:
             for j, sample_id in enumerate(sample_ids):
                 self.current_epoch_ensem_logits[sample_id] = ensem_logits[-1][j].detach()
 
-        return logitlist, ensem_logits
+        # 计算对比学习损失
+        contrastive_loss = torch.tensor(0.0, device=x.device)
+        if self.use_contrastive_learning and labels is not None and contrastive_features is not None:
+            contrastive_loss = self.compute_contrastive_loss(contrastive_features, labels)
+
+        return logitlist, ensem_logits, contrastive_loss
 
         # return logitlist, ensem_logits, featurelist
 
