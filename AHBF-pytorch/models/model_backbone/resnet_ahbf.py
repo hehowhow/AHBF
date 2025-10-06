@@ -383,11 +383,11 @@ class ResNet(nn.Module):
         self.current_epoch_ensem_logits = {}  # 存储当前epoch的融合输出
         
         # 对比学习相关参数
-        self.use_contrastive_learning = True  # 控制是否使用对比学习
+        self.use_contrastive_learning = False  # 控制是否使用对比学习
         self.feature_dim = 64  # 特征维度
         self.contrastive_temp = 0.1  # 对比学习温度参数
         self.class_centers = {}  # 存储每个类的中心特征向量 {class_id: center_vector}
-        self.center_momentum = 0.6  # 类中心动量更新参数
+        self.center_momentum = 0  # 类中心动量更新参数
         self.center_counts = {}  # 记录每个类的样本数量 {class_id: count}
         
         # 添加特征投影层：将layer2输出投影到64维
@@ -560,46 +560,59 @@ class ResNet(nn.Module):
         """
         if not self.use_contrastive_learning:
             return torch.tensor(0.0, device=features.device)
-        
+
         # 如果类中心太少，使用简化的对比学习
         if len(self.class_centers) < 2:
             return torch.tensor(0.0, device=features.device)
-        
+
         batch_size = features.size(0)
         device = features.device
-        
+
+        # 建立类别ID到索引的映射
+        class_ids = sorted(self.class_centers.keys())
+        class_id_to_idx = {class_id: idx for idx, class_id in enumerate(class_ids)}
+
         # 计算与所有类中心的相似度
         similarities = []
-        for class_id in self.class_centers:
+        for class_id in class_ids:
             center = self.class_centers[class_id].to(device)
             # 计算余弦相似度
             sim = F.cosine_similarity(features, center.unsqueeze(0).expand(batch_size, -1), dim=1)
             similarities.append(sim)
-        
-        # 堆叠相似度 [batch_size, num_classes]
+
+        # 堆叠相似度 [batch_size, num_existing_classes]
         similarities = torch.stack(similarities, dim=1) / self.contrastive_temp
-        
+
         # 计算InfoNCE损失
         contrastive_loss = 0.0
+        valid_samples = 0
         for i in range(batch_size):
             label = labels[i].item()
             if label in self.class_centers:
+                # 获取该类别在类中心列表中的索引
+                label_idx = class_id_to_idx[label]
+
                 # 正样本相似度（同类）
-                pos_sim = similarities[i, label]
-                # 负样本相似度（异类）
-                neg_sims = similarities[i]
-                # 移除正样本
-                mask = torch.ones_like(neg_sims, dtype=torch.bool)
-                mask[label] = False
-                neg_sims = neg_sims[mask]
-                
+                pos_sim = similarities[i, label_idx]
+
+                # 负样本相似度（异类）- 除了当前类别的所有类中心
+                neg_sims = torch.cat([
+                    similarities[i, :label_idx],
+                    similarities[i, label_idx + 1:]
+                ])
+
                 if len(neg_sims) > 0:
                     # InfoNCE损失：-log(exp(pos_sim) / (exp(pos_sim) + sum(exp(neg_sims))))
                     logits = torch.cat([pos_sim.unsqueeze(0), neg_sims])
                     log_prob = pos_sim - torch.logsumexp(logits, dim=0)
                     contrastive_loss += -log_prob
-        
-        return contrastive_loss / batch_size
+                    valid_samples += 1
+
+        # 只对有效样本计算平均损失
+        if valid_samples > 0:
+            return contrastive_loss / valid_samples
+        else:
+            return torch.tensor(0.0, device=features.device)
 
     def update_class_centers_online(self, features, labels):
         """
@@ -617,7 +630,7 @@ class ResNet(nn.Module):
             
             if label_id in self.class_centers:
                 # 自适应动量：样本越多，动量越大，更新越保守
-                adaptive_momentum = min(0.99, self.center_momentum + 
+                adaptive_momentum = min(0.90, self.center_momentum +
                                        self.center_counts[label_id] * 0.001)
                 self.class_centers[label_id] = (
                     adaptive_momentum * self.class_centers[label_id] + 

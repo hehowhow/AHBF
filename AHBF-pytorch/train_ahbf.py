@@ -57,7 +57,7 @@ parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
 parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
 parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='use adaptive weighting based on cosine similarity: default(True)')
-parser.add_argument('--use_contrastive_learning', default=True, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
+parser.add_argument('--use_contrastive_learning', default=False, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
 parser.add_argument('--contrastive_weight', default=0.1, type=float, help='weight for contrastive learning loss: default(0.1)')
 parser.add_argument('--contrastive_temp', default=0.1, type=float, help='temperature parameter for contrastive learning: default(0.1)')
 parser.add_argument('--center_momentum', default=0.9, type=float, help='momentum for online center update: default(0.9)')
@@ -109,10 +109,10 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
             labels_batch = labels_batch.to(device)
 
             # 模型前向传播，现在返回对比学习损失
-            if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
-                logitlist, ensem_logits, contrastive_loss = model(train_batch, labels=labels_batch)
-            else:
-                logitlist, ensem_logits, contrastive_loss = model(train_batch), [], torch.tensor(0.0, device=device)
+            # if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
+            logitlist, ensem_logits, contrastive_loss = model(train_batch, labels=labels_batch)
+            # else:
+            #     logitlist, ensem_logits, contrastive_loss = model(train_batch), [], torch.tensor(0.0, device=device)
             
             loss_true = 0
             loss_group_ekd = 0
@@ -222,10 +222,10 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
             loss_group_dkd = 0
             loss_group_ekd = 0
             # 在evaluate时也传递labels以计算对比学习损失
-            if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
-                logitlist, ensem_logits, contrastive_loss = model(test_batch, labels=labels_batch)
-            else:
-                logitlist, ensem_logits, contrastive_loss = model(test_batch), [], torch.tensor(0.0, device=device)
+            # if hasattr(model, 'use_contrastive_learning') and model.use_contrastive_learning:
+            logitlist, ensem_logits, contrastive_loss = model(test_batch, labels=labels_batch)
+            # else:
+                # logitlist, ensem_logits, contrastive_loss = model(test_batch), [], torch.tensor(0.0, device=device)
 
             for output in logitlist:
                 loss_true +=   criterion(output, labels_batch)
@@ -405,7 +405,7 @@ if __name__ == '__main__':
         print("Directory does not exist! Making directory {}".format(model_dir))
         os.makedirs(model_dir)
     wandb.init(config=vars(args), project="AHBF", notes=args.wandb_notes, \
-               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight))
+               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight),mode="offline")
 
     # Set the logger
     utils.set_logger(os.path.join(model_dir, 'train.log'))
