@@ -386,7 +386,7 @@ class ResNet(nn.Module):
         self.feature_dim = 64  # 特征维度
         self.contrastive_temp = 0.1  # 对比学习温度参数
         self.class_centers = {}  # 存储每个类的中心特征向量 {class_id: center_vector}
-        self.center_momentum = 0.6  # 类中心动量更新参数
+        self.center_momentum = 0  # 类中心动量更新参数
         self.center_counts = {}  # 记录每个类的样本数量 {class_id: count}
         
         # 添加特征投影层：将layer2输出投影到64维
@@ -474,10 +474,14 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def compute_cosine_similarities(self, logitlist, sample_ids=None):
+    def compute_wasserstein_dissimilarities(self, logitlist, sample_ids=None):
         """
-        计算当前各分支logit与历史融合输出的余弦相似度（样本级别）
+        计算当前各分支logit与历史融合输出的一阶Wasserstein距离（样本级别）
         使用self.prev_ensem_logits字典来查找每个样本上一轮epoch的融合logit
+        
+        一阶Wasserstein距离（Earth Mover's Distance）更适合衡量概率分布之间的差异
+        对于离散分布，W1(P,Q) = sum|CDF_P(i) - CDF_Q(i)|，其中CDF是累积分布函数
+        
         Args:
             logitlist: 当前各分支的logit列表
             sample_ids: 样本ID列表，用于索引历史融合输出
@@ -499,19 +503,28 @@ class ResNet(nn.Module):
 
             for i, sample_id in enumerate(sample_ids):
                 if sample_id in self.prev_ensem_logits:
-                    # 计算当前样本与历史融合输出的余弦相似度
-                    current_logit = logit[i:i + 1]  # 保持维度
-                    prev_logit = self.prev_ensem_logits[sample_id]
+                    # 获取当前样本logit与历史融合输出
+                    current_logit = logit[i]  # [num_classes]
+                    prev_logit = self.prev_ensem_logits[sample_id]  # [num_classes]
 
-                    cos_sim = F.cosine_similarity(
-                        current_logit.view(1, -1),
-                        prev_logit.view(1, -1),
-                        dim=1
-                    )
-                    # 转换为相异度
-                    sample_dissimilarities[i] = 1.0 - cos_sim.item()
+                    # 将logits转换为概率分布（使用softmax）
+                    current_prob = F.softmax(current_logit, dim=0)  # [num_classes]
+                    prev_prob = F.softmax(prev_logit, dim=0)  # [num_classes]
+                    
+                    # 计算一阶Wasserstein距离
+                    # 对于离散分布，W1 = sum|CDF_current(k) - CDF_prev(k)|
+                    # 先对概率进行排序（按类别索引），然后计算累积分布函数
+                    current_cdf = torch.cumsum(current_prob, dim=0)
+                    prev_cdf = torch.cumsum(prev_prob, dim=0)
+                    
+                    # Wasserstein距离：CDF差异的L1范数
+                    wasserstein_dist = torch.sum(torch.abs(current_cdf - prev_cdf)).item()
+                    
+                    # 存储Wasserstein距离作为相异度
+                    sample_dissimilarities[i] = wasserstein_dist
                 else:
-                    # 如果没有历史记录，使用均匀权重
+                    # 如果没有历史记录，使用默认距离值
+                    # 最大Wasserstein距离约为2.0（当两个分布完全不重叠时）
                     sample_dissimilarities[i] = 1.0
 
             dissimilarities.append(sample_dissimilarities)
@@ -710,8 +723,9 @@ class ResNet(nn.Module):
 
         # 计算相异度权重（样本级别）
         # 使用self.prev_ensem_logits字典查找每个样本上一轮epoch的融合logit
+        # 使用一阶Wasserstein距离衡量当前logit与历史融合logit的差异
         if self.use_adaptive_weighting:
-            dissimilarities = self.compute_cosine_similarities(logitlist, sample_ids)
+            dissimilarities = self.compute_wasserstein_dissimilarities(logitlist, sample_ids)
             # dissimilarities已经是tensor列表，每个元素对应一个分支的样本级权重
         else:
             # 如果不使用自适应加权，使用均匀权重

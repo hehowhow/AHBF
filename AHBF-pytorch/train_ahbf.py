@@ -34,7 +34,7 @@ model_names = sorted(name for name in model_backbone.__dict__
 
 parser.add_argument('--model', metavar='ARCH', default='resnet32', type=str,
                     choices=model_names, help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet32)')
-parser.add_argument('--dataset', default='CIFAR100', type=str, help = 'Input the dataset name: default(CIFAR10)')
+parser.add_argument('--dataset', default='CIFAR10', type=str, help = 'Input the dataset name: default(CIFAR10)')
 parser.add_argument('--root', default='./Data', type=str, help = 'Dataset root')
 parser.add_argument('--num_epochs', default=300, type=int, help = 'Input the number of epoches: default(300)')
 parser.add_argument('--batch_size', default=128, type=int, help = 'Input the batch size: default(128)')
@@ -61,7 +61,7 @@ parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='u
 parser.add_argument('--use_contrastive_learning', default=True, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
 parser.add_argument('--contrastive_weight', default=0.1, type=float, help='weight for contrastive learning loss: default(0.1)')
 parser.add_argument('--contrastive_temp', default=0.1, type=float, help='temperature parameter for contrastive learning: default(0.1)')
-parser.add_argument('--center_momentum', default=0.6, type=float, help='momentum for online center update: default(0.6)')
+parser.add_argument('--center_momentum', default=0, type=float, help='momentum for online center update: default(0.6)')
 
 parser.add_argument('--wandb_notes', default='', type=str)
 parser.add_argument('--notes', default='', type=str)
@@ -379,7 +379,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc
             # Save best metrics in a json file in the model directory
             test_metrics['epoch'] = epoch + 1
-            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics.json"))
+            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics_cifar10_w1d.json"))
 
             # Save model and optimizer
             shutil.copyfile(last_path, os.path.join(model_dir, 'best.pth'))
@@ -415,7 +415,7 @@ if __name__ == '__main__':
         print("Directory does not exist! Making directory {}".format(model_dir))
         os.makedirs(model_dir)
     wandb.init(config=vars(args), project="AHBF", notes=args.wandb_notes, \
-               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight))
+               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight),mode="offline")
 
     # Set the logger
     utils.set_logger(os.path.join(model_dir, 'train.log'))
