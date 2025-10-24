@@ -474,17 +474,17 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def compute_cosine_similarities(self, logitlist, prev_ensem_logit, sample_ids=None):
+    def compute_cosine_similarities(self, logitlist, sample_ids=None):
         """
         计算当前各分支logit与历史融合输出的余弦相似度（样本级别）
+        使用self.prev_ensem_logits字典来查找每个样本上一轮epoch的融合logit
         Args:
             logitlist: 当前各分支的logit列表
-            prev_ensem_logit: 上一轮的最后一个融合logit
             sample_ids: 样本ID列表，用于索引历史融合输出
         Returns:
-            similarities: 归一化后的相异度列表
+            dissimilarities: 归一化后的相异度列表，每个元素对应一个分支的样本级权重
         """
-        if prev_ensem_logit is None or self.epoch_count == 0 or sample_ids is None:
+        if self.epoch_count == 0 or sample_ids is None or len(self.prev_ensem_logits) == 0:
             # 如果是第一个epoch或没有样本ID，返回均匀权重
             batch_size = logitlist[0].size(0)
             return [torch.ones(batch_size, device=logitlist[0].device)] * len(logitlist)
@@ -708,10 +708,10 @@ class ResNet(nn.Module):
         ensem_fea = []
         ensem_logits = []
 
-        # 计算相异度权重
         # 计算相异度权重（样本级别）
+        # 使用self.prev_ensem_logits字典查找每个样本上一轮epoch的融合logit
         if self.use_adaptive_weighting:
-            dissimilarities = self.compute_cosine_similarities(logitlist, None, sample_ids)
+            dissimilarities = self.compute_cosine_similarities(logitlist, sample_ids)
             # dissimilarities已经是tensor列表，每个元素对应一个分支的样本级权重
         else:
             # 如果不使用自适应加权，使用均匀权重
