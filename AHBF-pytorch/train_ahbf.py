@@ -43,7 +43,7 @@ parser.add_argument('--schedule', type=int, nargs='+', default=[150, 225],
 parser.add_argument('--wd', default=5e-4, type=float, help = 'Input the weight decay rate: default(5e-4)')
 parser.add_argument('--resume', default='', type=str, help = 'Input the path of resume model: default('')')
 parser.add_argument('--num_workers', default=8, type=int, help = 'Input the number of works: default(8)')
-parser.add_argument('--gpu_id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
+parser.add_argument('--gpu_id', default='1', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
 
 parser.add_argument('--num_branches', default=4, type=int, help = 'Input the number of branches: default(4)')
 parser.add_argument('--aux', default=2, type=int, help = 'multiplier for layers increasement default(4)')
@@ -348,7 +348,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc
             # Save best metrics in a json file in the model directory
             test_metrics['epoch'] = epoch + 1
-            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics.json"))
+            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics_originAHBF.json"))
 
             # Save model and optimizer
             shutil.copyfile(last_path, os.path.join(model_dir, 'best.pth'))
@@ -384,7 +384,7 @@ if __name__ == '__main__':
         print("Directory does not exist! Making directory {}".format(model_dir))
         os.makedirs(model_dir)
     wandb.init(config=vars(args), project="AHBF", notes=args.wandb_notes, \
-               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight))
+               name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight),mode="offline")
 
     # Set the logger
     utils.set_logger(os.path.join(model_dir, 'train.log'))
