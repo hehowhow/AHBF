@@ -1,0 +1,17 @@
+{
+    "test_loss": 8.32973438576807,
+    "test_true_loss": 6.972080743765529,
+    "test_group_ekd_loss": 0.9848034329052213,
+    "test_group_dkd_loss": 0.303772698663458,
+    "test_contrastive_loss": 2.3025827981248685,
+    "test_accTop1_target": 93.46321202531645,
+    "time": 3.684274435043335,
+    "test_acc_target": 93.46321202531645,
+    "test_acc_aux1": 93.80933544303798,
+    "test_acc_aux2": 93.94778481012658,
+    "test_acc_aux3": 94.0565664556962,
+    "test_accTop1_afm0": 93.61155063291139,
+    "test_accTop1_afm1": 93.60166139240506,
+    "test_accTop1_afm2": 93.66099683544304,
+    "epoch": 272
+}

@@ -44,7 +44,7 @@ parser.add_argument('--schedule', type=int, nargs='+', default=[150, 225],
 parser.add_argument('--wd', default=5e-4, type=float, help = 'Input the weight decay rate: default(5e-4)')
 parser.add_argument('--resume', default='', type=str, help = 'Input the path of resume model: default('')')
 parser.add_argument('--num_workers', default=8, type=int, help = 'Input the number of works: default(8)')
-parser.add_argument('--gpu_id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
+parser.add_argument('--gpu_id', default='1', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
 
 parser.add_argument('--num_branches', default=4, type=int, help = 'Input the number of branches: default(4)')
 parser.add_argument('--aux', default=2, type=int, help = 'multiplier for layers increasement default(4)')
@@ -58,8 +58,8 @@ parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
 parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
 parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='use adaptive weighting based on cosine similarity: default(True)')
-parser.add_argument('--use_contrastive_learning', default=True, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
-parser.add_argument('--contrastive_weight', default=0.1, type=float, help='weight for contrastive learning loss: default(0.1)')
+parser.add_argument('--use_contrastive_learning', default=False, type=bool, help='use contrastive learning with InfoNCE loss: default(True)')
+parser.add_argument('--contrastive_weight', default=0.03, type=float, help='weight for contrastive learning loss: default(0.1)')
 parser.add_argument('--contrastive_temp', default=0.1, type=float, help='temperature parameter for contrastive learning: default(0.1)')
 parser.add_argument('--center_momentum', default=0.6, type=float, help='momentum for online center update: default(0.6)')
 
@@ -255,7 +255,7 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
             loss_true_avg.update(loss_true.item())
             loss_group_ekd_avg.update(loss_group_ekd.item())
             loss_group_dkd_avg.update(loss_group_dkd.item())
-            loss_contrastive_avg.update(contrastive_loss.item())
+            loss_contrastive_avg.update(contrastive_weighted_loss.item())
             loss_avg.update(loss.item())
 
             # Update average loss and accuracy
@@ -379,7 +379,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc
             # Save best metrics in a json file in the model directory
             test_metrics['epoch'] = epoch + 1
-            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics.json"))
+            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics_cifar10_cosDistance_nonCon.json"))
 
             # Save model and optimizer
             shutil.copyfile(last_path, os.path.join(model_dir, 'best.pth'))

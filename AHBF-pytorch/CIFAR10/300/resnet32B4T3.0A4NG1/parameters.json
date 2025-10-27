@@ -1,0 +1,33 @@
+{
+    "model": "resnet32",
+    "dataset": "CIFAR10",
+    "root": "./Data",
+    "num_epochs": 300,
+    "batch_size": 128,
+    "lr": 0.1,
+    "schedule": [
+        150,
+        225
+    ],
+    "wd": 0.0005,
+    "resume": "",
+    "num_workers": 8,
+    "gpu_id": "1",
+    "num_branches": 4,
+    "aux": 4,
+    "loss": "KL",
+    "kd_T": 3.0,
+    "rampup": 240,
+    "kd_weight": 1.5,
+    "lambda2": 4.0,
+    "lambda1": 2.0,
+    "att_type": "conv",
+    "use_adaptive_weighting": true,
+    "use_contrastive_learning": true,
+    "contrastive_weight": 0.03,
+    "contrastive_temp": 0.1,
+    "center_momentum": 0.6,
+    "wandb_notes": "",
+    "notes": "",
+    "Total params": 3.33729
+}
