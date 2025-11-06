@@ -368,7 +368,8 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
     def __init__(self, block, layers, num_classes=10, num_branches=3, aux=0, type='conv',zero_init_residual=False,
-                 groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None,):
+                 groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None, 
+                 distance_metric='cosine'):
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -377,6 +378,7 @@ class ResNet(nn.Module):
         self.num_branches = num_branches
         # 添加历史融合输出存储（按样本级别）
         self.use_adaptive_weighting = True  # 控制是否使用自适应加权
+        self.distance_metric = distance_metric  # 'cosine' or 'wasserstein'
         self.epoch_count = 0  # 记录当前epoch
         self.prev_ensem_logits = {}  # 存储每个样本的历史融合输出 {sample_id: ensem_logit}
         self.current_epoch_ensem_logits = {}  # 存储当前epoch的融合输出
@@ -460,12 +462,39 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def compute_wasserstein_distance(self, logit1, logit2):
+        """
+        计算两个logit分布之间的1维Wasserstein距离（批量版本）
+        Args:
+            logit1: [batch_size, num_classes]
+            logit2: [batch_size, num_classes]
+        Returns:
+            distances: [batch_size] Wasserstein距离
+        """
+        # 将logits转换为概率分布
+        prob1 = F.softmax(logit1, dim=1)
+        prob2 = F.softmax(logit2, dim=1)
+        
+        # 对每个样本排序并计算累积分布函数
+        sorted_prob1, _ = torch.sort(prob1, dim=1)
+        sorted_prob2, _ = torch.sort(prob2, dim=1)
+        
+        # 计算累积分布函数
+        cdf1 = torch.cumsum(sorted_prob1, dim=1)
+        cdf2 = torch.cumsum(sorted_prob2, dim=1)
+        
+        # Wasserstein距离是两个CDF之间的L1距离
+        wasserstein_dist = torch.mean(torch.abs(cdf1 - cdf2), dim=1)
+        
+        return wasserstein_dist
+
     def compute_cosine_similarities(self, logitlist, prev_ensem_logit, sample_ids=None):
         """
-        计算当前各分支logit与历史融合输出的余弦相似度（样本级别）
+        计算当前各分支logit与历史融合输出的相异度（样本级别）
+        支持余弦相似度和Wasserstein距离两种度量方式
         Args:
             logitlist: 当前各分支的logit列表
-            prev_ensem_logit: 上一轮的最后一个融合logit
+            prev_ensem_logit: 上一轮的最后一个融合logit（未使用，保留用于兼容性）
             sample_ids: 样本ID列表，用于索引历史融合输出
         Returns:
             similarities: 归一化后的相异度列表
@@ -477,49 +506,65 @@ class ResNet(nn.Module):
 
         batch_size = logitlist[0].size(0)
         device = logitlist[0].device
+        num_classes = logitlist[0].size(1)
 
-        # 为每个样本计算相异度
+        # 构建历史logits张量，用于批量计算
+        # 检查哪些样本有历史记录
+        has_history = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        prev_logits_batch = torch.zeros(batch_size, num_classes, device=device)
+        
+        for i, sample_id in enumerate(sample_ids):
+            if sample_id in self.prev_ensem_logits:
+                has_history[i] = True
+                prev_logits_batch[i] = self.prev_ensem_logits[sample_id]
+        
+        # 如果没有任何历史记录，返回均匀权重
+        if not has_history.any():
+            return [torch.ones(batch_size, device=device)] * len(logitlist)
+
+        # 批量计算所有分支的相异度
         dissimilarities = []
         for logit in logitlist:
-            sample_dissimilarities = torch.zeros(batch_size, device=device)
-
-            for i, sample_id in enumerate(sample_ids):
-                if sample_id in self.prev_ensem_logits:
-                    # 计算当前样本与历史融合输出的余弦相似度
-                    current_logit = logit[i:i + 1]  # 保持维度
-                    prev_logit = self.prev_ensem_logits[sample_id]
-
-                    cos_sim = F.cosine_similarity(
-                        current_logit.view(1, -1),
-                        prev_logit.view(1, -1),
-                        dim=1
-                    )
-                    # 转换为相异度
-                    sample_dissimilarities[i] = 1.0 - cos_sim.item()
-                else:
-                    # 如果没有历史记录，使用均匀权重
-                    sample_dissimilarities[i] = 1.0
-
-            dissimilarities.append(sample_dissimilarities)
-
-        # 归一化相异度，使每个样本的权重和为1
-        normalized_dissimilarities = []
-        for i in range(batch_size):
-            sample_dissim = [dissim[i] for dissim in dissimilarities]
-            total_dissim = sum(sample_dissim)
-            if total_dissim > 0:
-                normalized_sample_dissim = [d / total_dissim for d in sample_dissim]
+            if self.distance_metric == 'cosine':
+                # 批量计算余弦相似度（仅对有历史记录的样本）
+                # 归一化logits以计算余弦相似度
+                logit_norm = F.normalize(logit, p=2, dim=1)
+                prev_norm = F.normalize(prev_logits_batch, p=2, dim=1)
+                
+                # 计算余弦相似度 (batch_size,)
+                cos_sim = torch.sum(logit_norm * prev_norm, dim=1)
+                
+                # 转换为相异度
+                dissim = 1.0 - cos_sim
+                
+            elif self.distance_metric == 'wasserstein':
+                # 批量计算Wasserstein距离
+                dissim = self.compute_wasserstein_distance(logit, prev_logits_batch)
+                
             else:
-                normalized_sample_dissim = [1.0 / len(sample_dissim)] * len(sample_dissim)
+                raise ValueError(f"Unknown distance metric: {self.distance_metric}")
+            
+            # 对于没有历史记录的样本，设置相异度为1.0
+            dissim = torch.where(has_history, dissim, torch.ones_like(dissim))
+            dissimilarities.append(dissim)
 
-            if i == 0:
-                normalized_dissimilarities = [[d] for d in normalized_sample_dissim]
-            else:
-                for j, d in enumerate(normalized_sample_dissim):
-                    normalized_dissimilarities[j].append(d)
-
-        # 转换为tensor
-        result = [torch.tensor(dissim, device=device) for dissim in normalized_dissimilarities]
+        # 批量归一化相异度，使每个样本的权重和为1
+        # Stack所有相异度 [num_branches, batch_size]
+        dissim_stack = torch.stack(dissimilarities, dim=0)
+        
+        # 计算每个样本的总相异度 [batch_size]
+        total_dissim = dissim_stack.sum(dim=0)
+        
+        # 归一化 [num_branches, batch_size]
+        normalized_dissim = torch.where(
+            total_dissim.unsqueeze(0) > 0,
+            dissim_stack / total_dissim.unsqueeze(0),
+            torch.ones_like(dissim_stack) / len(logitlist)
+        )
+        
+        # 转换回列表格式
+        result = [normalized_dissim[i] for i in range(len(logitlist))]
+        
         return result
 
     def update_epoch_history(self):

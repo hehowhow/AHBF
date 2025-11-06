@@ -16,14 +16,15 @@ import models.data_loader as data_loader
 import models
 import models.model_backbone as model_backbone
 import wandb
-os.environ["WANDB_MODE"] = "offline"
+
 # Set the random seed for reproducible experiments
-random.seed(10)
-torch.manual_seed(10)
-# if torch.cuda.is_available(): torch.cuda.manual_seed(97)
+random.seed(97)
+torch.manual_seed(97)
+# if torch.cuda.is_available(): 
+torch.cuda.manual_seed(97)
 torch.backends.cudnn.benchmark = True
 # torch.backends.cudnn.deterministic = True
-
+os.environ['WANDB_API_KEY'] = '91f59aff4c5d1fdaa27e250633c3ae9e465a6664'
 
 # Set parameters
 parser = argparse.ArgumentParser()
@@ -34,8 +35,8 @@ model_names = sorted(name for name in model_backbone.__dict__
 
 parser.add_argument('--model', metavar='ARCH', default='resnet32', type=str,
                     choices=model_names, help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet32)')
-parser.add_argument('--dataset', default='CIFAR100', type=str, help = 'Input the dataset name: default(CIFAR10)')
-parser.add_argument('--root', default='./Data', type=str, help = 'Dataset root')
+parser.add_argument('--dataset', default='CIFAR10', type=str, help = 'Input the dataset name: default(CIFAR10)')
+parser.add_argument('--root', default='/home/howhow/distillation/Data', type=str, help = 'Dataset root')
 parser.add_argument('--num_epochs', default=300, type=int, help = 'Input the number of epoches: default(300)')
 parser.add_argument('--batch_size', default=128, type=int, help = 'Input the batch size: default(128)')
 parser.add_argument('--lr', default=0.1, type=float, help = 'Input the learning rate: default(0.1)')
@@ -58,9 +59,14 @@ parser.add_argument('--lambda2', default=1.0, type=float)
 parser.add_argument('--lambda1', default=1.0, type=float)
 parser.add_argument('--att_type', default='conv', type=str, help='use cbam, se, nonlocal to employ different attention mechanism: default(conv)')
 parser.add_argument('--use_adaptive_weighting', default=True, type=bool, help='use adaptive weighting based on cosine similarity: default(True)')
+parser.add_argument('--distance_metric', default='wasserstein', type=str, choices=['cosine', 'wasserstein'], 
+                    help='distance metric for adaptive weighting: cosine or wasserstein (default: cosine)')
 
 parser.add_argument('--wandb_notes', default='', type=str)
 parser.add_argument('--notes', default='', type=str)
+parser.add_argument('--use_wandb', action='store_true', help = 'Use Weights & Biases for logging: default(False)')
+parser.add_argument('--wandb_project', default='PHR', type=str, help = 'W&B project name: default(OKDDip-GL)')
+parser.add_argument('--wandb_entity', default='swufe1hh-cstc', type=str, help = 'W&B entity (username or team): default(None)')
 ll=time.time()
 
 args = parser.parse_args()
@@ -349,7 +355,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc
             # Save best metrics in a json file in the model directory
             test_metrics['epoch'] = epoch + 1
-            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics.json"))
+            utils.save_dict_to_json(test_metrics, os.path.join(model_dir, "test_best_metrics_DIV_wandb.json"))
 
             # Save model and optimizer
             shutil.copyfile(last_path, os.path.join(model_dir, 'best.pth'))
@@ -388,7 +394,7 @@ if __name__ == '__main__':
                name=args.model+'_aux'+str(args.aux) + '_k' + str(args.kd_weight))
 
     # Set the logger
-    utils.set_logger(os.path.join(model_dir, 'train.log'))
+    utils.set_logger(os.path.join(model_dir, 'test_best_metrics_DIV_wandb.log'))
 
     # Create the input data pipeline
     logging.info("Loading the datasets...")
@@ -411,7 +417,8 @@ if __name__ == '__main__':
     model_fd = getattr(models, model_folder)
     if "resnet" in args.model:
         model_cfg = getattr(model_fd, 'resnet_ahbf')
-        model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,aux=args.aux,type=args.att_type)
+        model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
+                                                aux=args.aux, type=args.att_type, distance_metric=args.distance_metric)
     elif "vgg" in args.model:
         model_cfg = getattr(model_fd, 'vgg_ahbf')
         model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,aux=args.aux)
@@ -425,6 +432,8 @@ if __name__ == '__main__':
     # 设置自适应加权参数
     if hasattr(model, 'use_adaptive_weighting'):
         model.use_adaptive_weighting = args.use_adaptive_weighting
+    if hasattr(model, 'distance_metric'):
+        model.distance_metric = args.distance_metric
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model).to(device)
