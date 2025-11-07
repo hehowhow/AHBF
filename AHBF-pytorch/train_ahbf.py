@@ -168,24 +168,29 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
                      'train_group_dkd_loss': loss_group_dkd_avg.value(),
                      'train_accTop1_target': accTop1_avg[0].value(),
                      'time': time.time() - end}
-    wandb.log({'trainloss': loss_avg.value(),
-               'trainlossce': loss_true_avg.value(),
-               'trainloss_ekd':loss_group_ekd_avg.value(),
-               'trainloss_dkd':loss_group_dkd_avg.value()})
+    
+    # 收集所有wandb指标到一个字典
+    wandb_metrics = {
+        'trainloss': loss_avg.value(),
+        'trainlossce': loss_true_avg.value(),
+        'trainloss_ekd': loss_group_ekd_avg.value(),
+        'trainloss_dkd': loss_group_dkd_avg.value(),
+        'train_acc_target': accTop1_avg[0].value()
+    }
+    
     train_metrics.update({'train_acc_target' : accTop1_avg[0].value()})
-    wandb.log({'train_acc_target' : accTop1_avg[0].value()})
 
     for i in range(1,args.num_branches ):
         train_metrics.update({'train_acc_aux'+str(i) : accTop1_avg[i].value()})
-        wandb.log({'train_acc_aux' + str(i): accTop1_avg[i].value()})
+        wandb_metrics['train_acc_aux' + str(i)] = accTop1_avg[i].value()
 
     for i in range(0,args.num_branches-1 ):
         train_metrics.update({'train_acc_afm'+str(i) : eaccTop1_avg[i].value()})
-        wandb.log({'train_acc_afm' + str(i): eaccTop1_avg[i].value()})
+        wandb_metrics['train_acc_afm' + str(i)] = eaccTop1_avg[i].value()
 
     metrics_string = " ; ".join("{}: {:05.3f}".format(k, v) for k, v in train_metrics.items())
     logging.info("- Train metrics: " + metrics_string)
-    return train_metrics
+    return train_metrics, wandb_metrics
 
 
 def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_weight):
@@ -259,21 +264,26 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_
                      'test_group_dkd_loss': loss_group_dkd_avg.value(),
                      'test_accTop1_target': accTop1_avg[0].value(),
                      'time': time.time() - end}
-    wandb.log({'testloss': loss_avg.value()})  # measure elapsed time
+    
+    # 收集所有wandb指标到一个字典
+    wandb_metrics = {
+        'testloss': loss_avg.value(),
+        'test_acc_target': accTop1_avg[0].value()
+    }
+    
     test_metrics.update({'test_acc_target' : accTop1_avg[0].value()})
-    wandb.log({'test_acc_target' : accTop1_avg[0].value()})
 
     for i in range(1,args.num_branches ):
         test_metrics.update({'test_acc_aux'+str(i) : accTop1_avg[i].value()})
-        wandb.log({'test_acc_aux' + str(i): accTop1_avg[i].value()})
+        wandb_metrics['test_acc_aux' + str(i)] = accTop1_avg[i].value()
 
     for i in range(0,args.num_branches-1 ):
         test_metrics.update({'test_accTop1_afm'+str(i) : eaccTop1_avg[i].value()})
-        wandb.log({'test_acc_afm' + str(i): eaccTop1_avg[i].value()})
+        wandb_metrics['test_acc_afm' + str(i)] = eaccTop1_avg[i].value()
 
     metrics_string = " ; ".join("{}: {:05.3f}".format(k, v) for k, v in test_metrics.items())
     logging.info("- Test metrics: " + metrics_string)
-    return test_metrics
+    return test_metrics, wandb_metrics
 
 def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, criterion_T, accuracy, model_dir, args):
 
@@ -313,8 +323,6 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         result_test_metrics = torch.load(os.path.join(args.resume, 'test_metrics'))
 
     for epoch in range(start_epoch, args.num_epochs):
-        wandb.log({'epoch': epoch})
-
         scheduler.step()
 
         # Run one epoch
@@ -324,9 +332,9 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         rampup_weight = get_current_rampup_weight(epoch, args.rampup)*0.5
 
         # compute number of batches in one epoch (one full pass over the training set)
-        train_metrics = train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, rampup_weight)
+        train_metrics, train_wandb_metrics = train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, rampup_weight)
 
-        test_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_weight)
+        test_metrics, test_wandb_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, rampup_weight)
 
         test_acc = test_metrics['test_accTop1_target']
 
@@ -346,7 +354,6 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
                         'test_accTop1': test_metrics['test_accTop1_target']}, last_path)
         # If best_eval, best_save_path
         is_best = test_acc >= best_acc
-        wandb.log({'val_acc_best': best_acc})
 
         if is_best:
             logging.info("- Found better accuracy")
@@ -359,6 +366,16 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
 
             # Save model and optimizer
             shutil.copyfile(last_path, os.path.join(model_dir, 'best.pth'))
+        
+        # 合并所有wandb指标并一次性记录（每个epoch只记录一次）
+        all_wandb_metrics = {
+            'epoch': epoch,
+            'val_acc_best': best_acc
+        }
+        all_wandb_metrics.update(train_wandb_metrics)
+        all_wandb_metrics.update(test_wandb_metrics)
+        wandb.log(all_wandb_metrics)
+    
     if os.path.exists(f'./results1{args.gpu_id}.txt'):
         with open(f'./results1{args.gpu_id}.txt','a') as f:
             f.write(str(best_acc)+'\n')
