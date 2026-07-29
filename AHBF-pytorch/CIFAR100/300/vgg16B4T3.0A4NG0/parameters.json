@@ -1,0 +1,30 @@
+{
+    "model": "vgg16",
+    "dataset": "CIFAR100",
+    "root": "/home/howhow/distillation/Data",
+    "num_epochs": 300,
+    "batch_size": 128,
+    "lr": 0.1,
+    "schedule": [
+        150,
+        225
+    ],
+    "wd": 0.0005,
+    "resume": "",
+    "num_workers": 8,
+    "gpu_id": "0",
+    "num_branches": 4,
+    "aux": 4,
+    "loss": "KL",
+    "kd_T": 3.0,
+    "rampup": 240,
+    "kd_weight": 1.5,
+    "lambda2": 4.0,
+    "lambda1": 2.0,
+    "att_type": "conv",
+    "use_adaptive_weighting": true,
+    "distance_metric": "wasserstein",
+    "wandb_notes": "",
+    "notes": "",
+    "Total params": 96.517602
+}
